@@ -8,6 +8,10 @@ library("doMC")
 # This library is for parallelization on Windows, in case that is ever needed. 
 # library(doSnow)
 
+# ------------------------------------------------------------------------------
+# Other libraries related to the script
+# ------------------------------------------------------------------------------
+
 library("caret")
 library("DBI")
 library("RSQLite")
@@ -22,6 +26,9 @@ generate_query <- function(index, total_chunks) {
     # acting like a random record filter. Note the `%d` within the `sprintf`
     # template string which is what you will use when parametrizing your own 
     # queries.
+
+    # In case your string template has a natural '%' within it, it must be
+    # escaped by putting another '%' in front of it as you see in this example.
 
     # For a list of templating parameters for `sprintf` strings, see: 
     # https://www.rdocumentation.org/packages/base/versions/3.6.2/topics/sprintf
@@ -59,13 +66,36 @@ generate_egress_path <- function(index, total_chunks) {
 # Path where the model is stored on disk so it can be loaded. 
 MODEL_PATH <- file.path("model", "model.rds")
 
-# The number of "chunks" that the master data should be split up into. 
+# The number of "chunks" that the master data should be split up into. This 
+# should be a large number to keep each "chunk" relatively small in memory. In
+# this script, it is kept small for convenience purposes. This could be set to
+# a large number safely (e.g. 10000)
 INGRESS_CHUNKS <- 3
 
-# Number of CPU cores available. This can be found by running `nproc` on Linux
-# command-line. Parallel computations aren't utilized until Step 3 via 
-# the`foreach` invokation.
-registerDoMC(4)
+# This determines how many threads will execute will execute simultaneously. 
+# All the threads will compete greedily for work available, but the end-user
+# doesn't have to manage that. 
+#
+# For example, suppose I need to score 200GB worth of data. I likely cannot fit
+# this all into memory, so I need to chunk the results into smaller pieces. 
+# If my machine has 16GB of memory, I want to utilize about 14GB of memory for
+# the scoring and leave the rest to system processes. 
+#
+# Suppose your Linux machine has four cores, and thus four threads to execute
+# instructions in parallel. Since I want to keep the _overall_ memory limitation
+# to 14GB, this means each thread should use about 3.5GB of memory. As a result,
+# the `INGRESS_CHUNKS` should be set so that each chunk of data is smaller than
+# 3.5GB in memory. 
+#
+# Each parallel iteration consumes only one chunk at a time, and the work is
+# distributed evenly across the threads on a first-come first-served basis,
+# meaning once a thread has finished its work, it pulls the next chunk 
+# "from the queue" and begins to score it. This ensures that across all the 
+# threads, no more than 14GB is being used at a time, thus ensuring you have 
+# "fixed" memory usage. Similarly, all 200GB will eventually be scored, provided
+# they fit on disk. 
+NUM_THREADS <- 4
+registerDoMC(NUM_THREADS)
 
 # ------------------------------------------------------------------------------
 # Step -1: Train a simple regression model to predict `mpg` from the classic
@@ -90,9 +120,9 @@ dbWriteTable(con, "mtcars", mtcars)
 #   access within the same client. 
 
 #   Your mileage may vary - it's worth trying the approach from Step 3 to speed 
-#   up data ingestion, but be aware all  threads pull from the same system 
+#   up data ingestion, but be aware all threads pull from the same system 
 #   memory, so if each loop iteration requires 5GB of memory to store the 
-#   data-pull, across four different `INGRESS_CHUNKS` then your total memory 
+#   data-pull, across four different `INGRESS_CHUNKS` your total memory 
 #   usage will be at least 20GB. 
 # ------------------------------------------------------------------------------
 
@@ -106,7 +136,7 @@ for (i in 1:INGRESS_CHUNKS) {
     data_chunk <- dbGetQuery(con, chunk_query)
     chunk_save_path <- generate_ingress_path(i, INGRESS_CHUNKS)
 
-    write.csv(x = data_chunk, file = chunk_save_path)
+    write.csv(x = data_chunk, file = chunk_save_path, row.names = FALSE)
 
 }
 
@@ -118,7 +148,7 @@ for (i in 1:INGRESS_CHUNKS) {
 model <- readRDS(MODEL_PATH)
 
 # ------------------------------------------------------------------------------
-# Step 3. Execute the scoring in parallel. The reason we creates separate
+# Step 3. Execute the scoring in parallel. The reason we create separate
 #   ingress chunks was to avoid locking when multiple threads attempt to access
 #   the same file to pull in the data. 
 #
@@ -127,7 +157,8 @@ model <- readRDS(MODEL_PATH)
 # ------------------------------------------------------------------------------
 
 # We throw-away the results from the parallel execution since we care about
-# the side-effect and not the return value. 
+# the side-effect and not the return value. The variable name for storing the
+# result is arbitrary and not significant. 
 
 throw_away <- foreach(i = 1:INGRESS_CHUNKS) %dopar% {
 
